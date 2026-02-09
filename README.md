@@ -30,7 +30,7 @@ rockhard_nix/
 │   ├── dev-shell.nix      # Dev shell with colmena CLI
 │   └── images.nix         # Nix-built OCI container images
 ├── hosts/
-│   ├── macmini/           # Mac Mini 5,1 (2011)
+│   ├── macmini/           # Mac Mini 5,1 (2011) — dual boot with macOS
 │   │   ├── default.nix    # Host-specific config
 │   │   └── hardware.nix   # Generated hardware config
 │   └── _template/         # Copy this for new machines
@@ -51,97 +51,167 @@ rockhard_nix/
 
 ---
 
-## Phase 1: Prepare the NixOS USB Installer
+## Phase 1: Prepare (do this on macOS BEFORE booting the installer)
 
-On your current machine (macOS or Linux):
+### 1a. Back up your data
+
+Time Machine or manual copy. The resize is generally safe, but always back up first.
+
+### 1b. Shrink the macOS partition
+
+Open **Disk Utility** (Applications → Utilities → Disk Utility):
+
+1. Select your internal SSD in the sidebar
+2. Click **Partition**
+3. Resize the macOS partition down to **60–80 GB** (enough for High Sierra + essentials)
+4. **Don't create a new partition** in the free space — just leave it unallocated
+5. Click **Apply** and wait for the resize to finish
+
+If Disk Utility won't resize (sometimes it's stubborn), use Terminal:
 
 ```sh
-# Download the NixOS minimal ISO
+# Check current layout
+diskutil list
+
+# Resize macOS to 70GB (adjust to your preference)
+# Replace disk0s2 with your actual macOS partition identifier
+sudo diskutil resizeVolume disk0s2 70G
+```
+
+After this, your 250GB SSD should look roughly like:
+
+```
+┌──────────┬────────────────────┬──────────────────────────────────┬──────────┐
+│ EFI      │ macOS (High Sierra)│           FREE SPACE             │ Recovery │
+│ ~200MB   │     ~70GB          │           ~170GB                 │ ~650MB   │
+└──────────┴────────────────────┴──────────────────────────────────┴──────────┘
+```
+
+### 1c. Download the NixOS Minimal ISO
+
+```sh
 curl -L -o ~/Downloads/nixos-minimal.iso \
   https://channels.nixos.org/nixos-24.11/latest-nixos-minimal-x86_64-linux.iso
 ```
 
-### Write to USB (macOS)
+### 1d. Write the ISO to USB
 
 ```sh
-diskutil list                               # find your USB disk
-diskutil unmountDisk /dev/diskN             # unmount it
-sudo dd if=~/Downloads/nixos-minimal.iso of=/dev/rdiskN bs=4m status=progress
+# Find the USB disk — look for the 8GB+ one (NOT your internal SSD!)
+diskutil list
+
+# Unmount it (replace disk2 with YOUR USB disk number)
+diskutil unmountDisk /dev/disk2
+
+# Write the ISO (rdisk is faster — replace disk2!)
+sudo dd if=~/Downloads/nixos-minimal.iso of=/dev/rdisk2 bs=4m status=progress
 ```
 
-### Write to USB (Linux)
+### 1e. Note your disk layout
+
+Before rebooting, write down the output of:
 
 ```sh
-lsblk                                       # find your USB disk
-sudo dd if=~/Downloads/nixos-minimal.iso of=/dev/sdX bs=4M status=progress
+diskutil list
 ```
 
-> ⚠️ Double-check the disk number. `dd` will happily erase the wrong drive.
+You'll need to know which partition is the EFI System Partition (usually `disk0s1`).
 
 ---
 
-## Phase 2: Install NixOS on the Mac Mini
+## Phase 2: Install NixOS (dual boot)
 
-### Boot from USB
+### 2a. Boot from USB
 
 1. Shut down the Mac Mini
-2. Plug in USB drive + keyboard + wired ethernet
+2. Plug in USB drive + keyboard + **wired ethernet**
 3. Power on, **hold Option (⌥)** immediately
 4. Select the USB drive (shows as "EFI Boot")
+5. You'll land at a NixOS console as `root`
 
-### Verify network
+### 2b. Verify network
 
 ```sh
+# Wired ethernet should auto-configure via DHCP
 ping -c3 google.com
 ```
 
-### Partition the SSD
+### 2c. Identify your disk layout
 
 ```sh
-# Identify the internal SSD (likely /dev/sda, verify size = ~250GB)
+lsblk
+# or for more detail:
+fdisk -l /dev/sda
+```
+
+You should see something like:
+
+```
+sda1   200M  EFI System        ← KEEP — shared with macOS
+sda2    70G  Apple HFS/APFS    ← KEEP — macOS
+sda3   650M  Apple boot        ← KEEP — macOS Recovery
+       170G  (free space)      ← THIS is where NixOS goes
+```
+
+### 2d. Create NixOS partition in the free space
+
+> ⚠️ **DO NOT** run `mklabel` — that would wipe the entire partition table including macOS!
+
+```sh
+# Create the NixOS root partition in the free space
+# The start/end values depend on your layout — use the free space AFTER macOS
+parted /dev/sda -- mkpart root ext4 71GB 100%
+
+# Check what partition number it got (likely sda4)
 lsblk
 
-# Wipe and create GPT partition table
-parted /dev/sda -- mklabel gpt
+# Format the new partition
+mkfs.ext4 -L nixos /dev/sda4
+```
 
-# EFI System Partition (512MB)
-parted /dev/sda -- mkpart ESP fat32 1MB 512MB
-parted /dev/sda -- set 1 esp on
+> If `parted` complains about partition alignment, that's fine — accept the default.
 
-# Root partition (rest of disk)
-parted /dev/sda -- mkpart root ext4 512MB 100%
+### 2e. Mount filesystems
 
-# Format
-mkfs.fat -F 32 -n BOOT /dev/sda1
-mkfs.ext4 -L nixos /dev/sda2
+```sh
+# Mount NixOS root
+mount /dev/sda4 /mnt
 
-# Mount
-mount /dev/sda2 /mnt
+# Mount the EXISTING EFI partition (shared with macOS)
 mkdir -p /mnt/boot
 mount /dev/sda1 /mnt/boot
 ```
 
-### Generate hardware config
+> **Important**: We're mounting the Mac's existing EFI partition at `/mnt/boot`.
+> GRUB will install alongside the macOS bootloader — it won't overwrite it.
+
+### 2f. Generate hardware config
 
 ```sh
 nixos-generate-config --root /mnt
 ```
 
-### Write the bootstrap config
+### 2g. Write the bootstrap config
 
 ```sh
 cat > /mnt/etc/nixos/configuration.nix << 'EOF'
 { config, pkgs, ... }: {
   imports = [ ./hardware-configuration.nix ];
 
+  # Dual boot — install GRUB to existing ESP alongside macOS
   boot.loader = {
     grub = {
       enable = true;
       efiSupport = true;
-      efiInstallAsRemovable = true;
+      efiInstallAsRemovable = true;  # Mac firmware quirk
       device = "nodev";
+      # Detect macOS and add it to the boot menu
+      useOSProber = true;
     };
   };
+
+  # os-prober needs this to find macOS
+  boot.loader.grub.configurationLimit = 20;
 
   networking = {
     hostName = "macmini";
@@ -159,10 +229,10 @@ cat > /mnt/etc/nixos/configuration.nix << 'EOF'
 
   services.openssh = {
     enable = true;
-    settings.PasswordAuthentication = true;
+    settings.PasswordAuthentication = true;  # temporary
   };
 
-  environment.systemPackages = with pkgs; [ vim git curl htop ];
+  environment.systemPackages = with pkgs; [ vim git curl htop os-prober ];
 
   virtualisation.podman = {
     enable = true;
@@ -175,7 +245,7 @@ cat > /mnt/etc/nixos/configuration.nix << 'EOF'
 EOF
 ```
 
-### Install
+### 2h. Install!
 
 ```sh
 nixos-install
@@ -185,11 +255,20 @@ reboot
 
 **Remove the USB drive during reboot.**
 
+### 2i. Choosing your OS at boot
+
+After reboot, you have two options:
+
+- **Hold Option (⌥)** at power-on → Mac's native boot picker shows macOS and NixOS
+- **Don't hold anything** → GRUB menu appears with NixOS + macOS entries
+
+To get back to macOS anytime, just hold **Option (⌥)** at boot and select "Macintosh HD".
+
 ---
 
 ## Phase 3: Apply Fleet Config
 
-### First boot
+### First boot into NixOS
 
 Log in as `devops` / `changeme`.
 
@@ -278,7 +357,7 @@ podman run --rm -it rockhard/example
    cp -r hosts/_template hosts/myhost
    ```
 
-2. Install NixOS on the new machine (Phase 2 above)
+2. Install NixOS on the new machine (Phase 2 above, or full-disk for dedicated servers)
 
 3. Copy the generated hardware config:
    ```sh
@@ -303,6 +382,18 @@ podman run --rm -it rockhard/example
    ```sh
    colmena apply --on myhost
    ```
+
+---
+
+## Booting Between macOS and NixOS
+
+| Action | Result |
+|--------|--------|
+| Normal power on | Boots into GRUB → NixOS (default) |
+| Hold **⌥** at power on | Mac boot picker → choose macOS or NixOS |
+| Select macOS in GRUB | Boots macOS (if os-prober detected it) |
+
+To change the default boot OS, edit the GRUB config or use macOS's Startup Disk preference pane.
 
 ---
 
